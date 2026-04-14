@@ -229,14 +229,15 @@ impl<Key: Eq + Hash, Val, We: Weighter<Key, Val>, B: BuildHasher, L: Lifecycle<K
         soft: bool,
     ) -> Result<L::RequestState, (Key, Val)> {
         let mut lcs = self.shard.lifecycle.begin_request();
-        self.shard.insert(
+        let result = self.shard.insert(
             &mut lcs,
             self.shard.hash(&key),
             key,
             value,
             InsertStrategy::Replace { soft },
-        )?;
-        Ok(lcs)
+        );
+        self.shard.flush_evictions(&mut lcs);
+        result.map(|_| lcs)
     }
 
     /// Retains only the items specified by the predicate.
@@ -267,6 +268,7 @@ impl<Key: Eq + Hash, Val, We: Weighter<Key, Val>, B: BuildHasher, L: Lifecycle<K
                 let v = with()?;
                 let mut lcs = self.shard.lifecycle.begin_request();
                 let replaced = self.shard.replace_placeholder(&mut lcs, &plh, false, v);
+                self.shard.flush_evictions(&mut lcs);
                 self.shard.lifecycle.end_request(lcs);
                 debug_assert!(replaced.is_ok(), "unsync replace_placeholder can't fail");
                 plh.idx
@@ -293,6 +295,7 @@ impl<Key: Eq + Hash, Val, We: Weighter<Key, Val>, B: BuildHasher, L: Lifecycle<K
                 let v = with()?;
                 let mut lcs = self.shard.lifecycle.begin_request();
                 let replaced = self.shard.replace_placeholder(&mut lcs, &plh, false, v);
+                self.shard.flush_evictions(&mut lcs);
                 debug_assert!(replaced.is_ok(), "unsync replace_placeholder can't fail");
                 self.shard.lifecycle.end_request(lcs);
                 plh.idx
@@ -365,6 +368,7 @@ impl<Key: Eq + Hash, Val, We: Weighter<Key, Val>, B: BuildHasher, L: Lifecycle<K
         );
         // result cannot err with the Insert strategy
         debug_assert!(result.is_ok());
+        self.shard.flush_evictions(&mut lcs);
         lcs
     }
 
@@ -480,6 +484,7 @@ impl<Key: Eq + Hash, Val, We: Weighter<Key, Val>, B: BuildHasher, L: Lifecycle<K
             self.cache
                 .shard
                 .replace_placeholder(&mut lcs, &self.placeholder, false, value);
+        self.cache.shard.flush_evictions(&mut lcs);
         debug_assert!(replaced.is_ok(), "unsync replace_placeholder can't fail");
         self.inserted = true;
         if return_lcs {

@@ -140,6 +140,9 @@ pub struct CacheShard<Key, Val, We, B, L, Plh> {
     misses: AtomicU64,
     weighter: We,
     pub(crate) lifecycle: L,
+    /// Evicted items collected while the shard lock is held.
+    /// Drained and passed to `on_evict` after the lock is released.
+    pub(crate) eviction_buffer: Vec<(Key, Val)>,
 }
 
 impl<Key: Clone, Val: Clone, We: Clone, B: Clone, L: Clone, Plh: Clone> Clone
@@ -167,6 +170,7 @@ impl<Key: Clone, Val: Clone, We: Clone, B: Clone, L: Clone, Plh: Clone> Clone
             misses: self.misses.load(atomic::Ordering::Relaxed).into(),
             weighter: self.weighter.clone(),
             lifecycle: self.lifecycle.clone(),
+            eviction_buffer: Vec::new(),
         }
     }
 }
@@ -361,6 +365,17 @@ impl<
             weight_cold: 0,
             weighter,
             lifecycle,
+            eviction_buffer: Vec::new(),
+        }
+    }
+
+    /// Drains the eviction buffer and calls `on_evict` for each item.
+    ///
+    /// Must be called after any shard operation that may evict items, once the caller
+    /// has confirmed no lock is held (unsync path) or after the lock has been released (sync path).
+    pub fn flush_evictions(&mut self, lcs: &mut L::RequestState) {
+        for (key, val) in self.eviction_buffer.drain(..) {
+            self.lifecycle.on_evict(lcs, key, val);
         }
     }
 
@@ -783,7 +798,7 @@ impl<
             if self.num_non_resident > self.capacity_non_resident {
                 self.advance_ghost();
             }
-            self.lifecycle.on_evict(lcs, evicted.key, evicted.value);
+            self.eviction_buffer.push((evicted.key, evicted.value));
             return true;
         }
     }
@@ -835,7 +850,7 @@ impl<
                     unsafe { core::hint::unreachable_unchecked() };
                 };
                 self.hot_head = next;
-                self.lifecycle.on_evict(lcs, evicted.key, evicted.value);
+                self.eviction_buffer.push((evicted.key, evicted.value));
                 self.map_remove(hash, idx);
             }
             return true;
@@ -920,7 +935,7 @@ impl<
                 } else if evicted_weight != 0 && weight == 0 {
                     *list_head = self.entries.unlink(idx);
                 }
-                self.lifecycle.on_evict(lcs, evicted.key, evicted.value);
+                self.eviction_buffer.push((evicted.key, evicted.value));
             }
             Entry::Ghost(_) => {
                 self.weight_hot += weight;
@@ -1007,7 +1022,7 @@ impl<
             weight = self.weighter.weight(&key, &value);
             // check again, it could have changed weight
             if weight > self.weight_target_hot {
-                return self.handle_overweight_replace_placeholder(lcs, placeholder, key, value);
+                return self.handle_overweight_replace_placeholder(placeholder, key, value);
             }
         }
 
@@ -1045,14 +1060,13 @@ impl<
     #[cold]
     fn handle_overweight_replace_placeholder(
         &mut self,
-        lcs: &mut L::RequestState,
         placeholder: &Plh,
         key: Key,
         value: Val,
     ) -> Result<(), Val> {
         self.entries.remove(placeholder.idx());
         self.map_remove(placeholder.hash(), placeholder.idx());
-        self.lifecycle.on_evict(lcs, key, value);
+        self.eviction_buffer.push((key, value));
         Ok(())
     }
 
@@ -1071,7 +1085,7 @@ impl<
             weight = self.weighter.weight(&key, &value);
             // check again, it could have changed weight
             if weight > self.weight_target_hot {
-                return self.handle_insert_overweight(lcs, hash, key, value, strategy);
+                return self.handle_insert_overweight(hash, key, value, strategy);
             }
         }
 
@@ -1113,7 +1127,6 @@ impl<
     #[cold]
     fn handle_insert_overweight(
         &mut self,
-        lcs: &mut L::RequestState,
         hash: u64,
         key: Key,
         value: Val,
@@ -1122,13 +1135,13 @@ impl<
         // Make sure to remove any existing entry
         if let Some((idx, _)) = self.search_resident(hash, &key) {
             if let Some((ek, ev)) = self.remove_internal(hash, idx) {
-                self.lifecycle.on_evict(lcs, ek, ev);
+                self.eviction_buffer.push((ek, ev));
             }
         }
         if matches!(strategy, InsertStrategy::Replace { .. }) {
             return Err((key, value));
         }
-        self.lifecycle.on_evict(lcs, key, value);
+        self.eviction_buffer.push((key, value));
         Ok(())
     }
 

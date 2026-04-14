@@ -196,6 +196,9 @@ pub trait Lifecycle<Key, Val> {
     fn before_evict(&self, state: &mut Self::RequestState, key: &Key, val: &mut Val) {}
 
     /// Called when an item is evicted.
+    ///
+    /// For the sync cache, this is called **after the shard lock has been released**, so it is
+    /// safe to perform blocking work, drop expensive values, or send to a channel here.
     fn on_evict(&self, state: &mut Self::RequestState, key: Key, val: Val);
 
     /// Called after a request finishes, e.g.: insert, replace.

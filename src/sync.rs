@@ -403,10 +403,14 @@ impl<
     ) -> Result<L::RequestState, (Key, Val)> {
         let mut lcs = self.lifecycle.begin_request();
         let (shard, hash) = self.shard_for(&key).unwrap();
-        shard
-            .write()
-            .insert(&mut lcs, hash, key, value, InsertStrategy::Replace { soft })?;
-        Ok(lcs)
+        let mut guard = shard.write();
+        let result = guard.insert(&mut lcs, hash, key, value, InsertStrategy::Replace { soft });
+        let evictions = std::mem::take(&mut guard.eviction_buffer);
+        drop(guard); // release the lock before calling on_evict
+        for (k, v) in evictions {
+            self.lifecycle.on_evict(&mut lcs, k, v);
+        }
+        result.map(|_| lcs)
     }
 
     /// Retains only the items specified by the predicate.
@@ -443,11 +447,16 @@ impl<
     pub fn insert_with_lifecycle(&self, key: Key, value: Val) -> L::RequestState {
         let mut lcs = self.lifecycle.begin_request();
         let (shard, hash) = self.shard_for(&key).unwrap();
-        let result = shard
-            .write()
-            .insert(&mut lcs, hash, key, value, InsertStrategy::Insert);
-        // result cannot err with the Insert strategy
-        debug_assert!(result.is_ok());
+        let evictions = {
+            let mut guard = shard.write();
+            let result = guard.insert(&mut lcs, hash, key, value, InsertStrategy::Insert);
+            // result cannot err with the Insert strategy
+            debug_assert!(result.is_ok());
+            std::mem::take(&mut guard.eviction_buffer)
+        };
+        for (k, v) in evictions {
+            self.lifecycle.on_evict(&mut lcs, k, v);
+        }
         lcs
     }
 
@@ -461,16 +470,19 @@ impl<
     ) -> ContendedResult<L::RequestState> {
         let (shard, hash) = self.shard_for(&key).unwrap();
 
-        shard
-            .try_write()
-            .map(|mut guard| {
-                let mut lcs = self.lifecycle.begin_request();
-                let result = guard.insert(&mut lcs, hash, key, value, InsertStrategy::Insert);
-                // result cannot err with the Insert strategy
-                debug_assert!(result.is_ok());
-                ContendedResult::Ok(lcs)
-            })
-            .unwrap_or(ContendedResult::Contended)
+        let Some(mut guard) = shard.try_write() else {
+            return ContendedResult::Contended;
+        };
+        let mut lcs = self.lifecycle.begin_request();
+        let result = guard.insert(&mut lcs, hash, key, value, InsertStrategy::Insert);
+        // result cannot err with the Insert strategy
+        debug_assert!(result.is_ok());
+        let evictions = std::mem::take(&mut guard.eviction_buffer);
+        drop(guard); // release the lock before calling on_evict
+        for (k, v) in evictions {
+            self.lifecycle.on_evict(&mut lcs, k, v);
+        }
+        ContendedResult::Ok(lcs)
     }
 
     /// Clear all items from the cache
