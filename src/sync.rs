@@ -1670,9 +1670,9 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
 
-        assert!(cache.try_remove(&1).is_ok_and(|v| v == Some((1, 10))));
-        assert!(cache.try_remove(&1).is_ok_and(|v| v == None));
-        assert!(cache.try_remove(&99).is_ok_and(|v| v == None));
+        assert!(cache.try_remove(&1).is_ok_and(|v| matches!(v, Some((1, 10)))));
+        assert!(cache.try_remove(&1).is_ok_and(|v| v.is_none()));
+        assert!(cache.try_remove(&99).is_ok_and(|v| v.is_none()));
     }
 
     #[test]
