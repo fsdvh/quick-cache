@@ -409,19 +409,9 @@ impl<
     /// Returns `Ok(())` if the item was inserted, or `Err((key, value))` if the shard lock
     /// could not be acquired without blocking.
     pub fn try_insert(&self, key: Key, value: Val) -> Result<(), (Key, Val)> {
-        let (shard, hash) = self.shard_for(&key).unwrap();
-
-        match shard.try_write() {
-            Some(mut shard) => {
-                let mut lcs = self.lifecycle.begin_request();
-                let result = shard.insert(&mut lcs, hash, key, value, InsertStrategy::Insert);
-                // result cannot err with the Insert strategy
-                debug_assert!(result.is_ok());
-                self.lifecycle.end_request(lcs);
-                Ok(())
-            }
-            _ => Err((key, value)),
-        }
+        let lcs = self.try_insert_with_lifecycle(key, value)?;
+        self.lifecycle.end_request(lcs);
+        Ok(())
     }
 
     /// Inserts an item in the cache with key `key`.
