@@ -1636,7 +1636,7 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
 
-        assert!(cache.try_get(&1).is_ok_and(|v| v == Some(10)));
+        assert!(cache.try_get(&1).is_ok_and(|v| matches!(v, Some(10))));
         assert!(cache.try_get(&2).is_ok_and(|v| v.is_none()));
     }
 
@@ -1653,7 +1653,7 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
 
-        assert!(cache.try_peek(&1).is_ok_and(|v| v == Some(10)));
+        assert!(cache.try_peek(&1).is_ok_and(|v| matches!(v, Some(10))));
         assert!(cache.try_peek(&2).is_ok_and(|v| v.is_none()));
     }
 
@@ -1670,7 +1670,9 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
 
-        assert!(cache.try_remove(&1).is_ok_and(|v| matches!(v, Some((1, 10)))));
+        assert!(cache
+            .try_remove(&1)
+            .is_ok_and(|v| matches!(v, Some((1, 10)))));
         assert!(cache.try_remove(&1).is_ok_and(|v| v.is_none()));
         assert!(cache.try_remove(&99).is_ok_and(|v| v.is_none()));
     }
