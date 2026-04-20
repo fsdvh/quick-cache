@@ -18,6 +18,17 @@ use crate::shard::EntryOrPlaceholder;
 pub use crate::sync_placeholder::{EntryAction, EntryResult, GuardResult, PlaceholderGuard};
 use crate::sync_placeholder::{JoinFuture, JoinResult};
 
+#[derive(Debug)]
+pub struct LockContention;
+
+impl std::fmt::Display for LockContention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lock Contention")
+    }
+}
+
+impl std::error::Error for LockContention {}
+
 /// A concurrent cache
 ///
 /// The concurrent cache is internally composed of equally sized shards, each of which is independently
@@ -250,7 +261,7 @@ impl<
     /// Attempts to check if a key exists in the cache without blocking.
     /// Returns `Ok(true)` if present, `Ok(false)` if absent,
     /// or `Err(())` if the shard lock could not be acquired without blocking.
-    pub fn try_contains_key<Q>(&self, key: &Q) -> Result<bool, ()>
+    pub fn try_contains_key<Q>(&self, key: &Q) -> Result<bool, LockContention>
     where
         Q: Hash + Equivalent<Key> + ?Sized,
     {
@@ -260,7 +271,7 @@ impl<
 
         match shard.try_read() {
             Some(guard) => Ok(guard.contains(hash, key)),
-            None => Err(()),
+            None => Err(LockContention),
         }
     }
 
@@ -276,7 +287,7 @@ impl<
     /// Attempts to fetch an item from the cache whose key is `key`.
     /// Returns `Ok(Some(val))` if the key is present, `Ok(None)` if absent,
     /// or `Err(())` if the shard lock could not be acquired without blocking.
-    pub fn try_get<Q>(&self, key: &Q) -> Result<Option<Val>, ()>
+    pub fn try_get<Q>(&self, key: &Q) -> Result<Option<Val>, LockContention>
     where
         Q: Hash + Equivalent<Key> + ?Sized,
     {
@@ -286,7 +297,7 @@ impl<
 
         match shard.try_read() {
             Some(guard) => Ok(guard.get(hash, key).cloned()),
-            None => Err(()),
+            None => Err(LockContention),
         }
     }
 
@@ -304,7 +315,7 @@ impl<
     /// Contrary to gets, peeks don't alter the key "hotness".
     /// Returns `Ok(Some(val))` if the key is present, `Ok(None)` if absent,
     /// or `Err(())` if the shard lock could not be acquired without blocking.
-    pub fn try_peek<Q>(&self, key: &Q) -> Result<Option<Val>, ()>
+    pub fn try_peek<Q>(&self, key: &Q) -> Result<Option<Val>, LockContention>
     where
         Q: Hash + Equivalent<Key> + ?Sized,
     {
@@ -313,7 +324,7 @@ impl<
         };
         match shard.try_read() {
             Some(guard) => Ok(guard.peek(hash, key).cloned()),
-            None => Err(()),
+            None => Err(LockContention),
         }
     }
 
@@ -330,7 +341,7 @@ impl<
     /// Attempts to remove an item from the cache whose key is `key`.
     /// Returns `Ok(Some(entry))` with the removed entry if present, `Ok(None)` if absent,
     /// or `Err(())` if the shard lock could not be acquired without blocking.
-    pub fn try_remove<Q>(&self, key: &Q) -> Result<Option<(Key, Val)>, ()>
+    pub fn try_remove<Q>(&self, key: &Q) -> Result<Option<(Key, Val)>, LockContention>
     where
         Q: Hash + Equivalent<Key> + ?Sized,
     {
@@ -340,7 +351,7 @@ impl<
 
         match shard.try_write() {
             Some(mut guard) => Ok(guard.remove(hash, key)),
-            None => Err(()),
+            None => Err(LockContention),
         }
     }
 
@@ -1605,8 +1616,8 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
 
-        assert_eq!(cache.try_contains_key(&1), Ok(true));
-        assert_eq!(cache.try_contains_key(&2), Ok(false));
+        assert!(cache.try_contains_key(&1).is_ok_and(|v| v));
+        assert!(cache.try_contains_key(&2).is_ok_and(|v| !v));
     }
 
     #[test]
@@ -1615,7 +1626,7 @@ mod tests {
         cache.insert(1, 10);
         // Hold write locks on all shards so try_read is blocked.
         let _guards: Vec<_> = cache.shards.iter().map(|s| s.write()).collect();
-        assert_eq!(cache.try_contains_key(&1), Err(()));
+        assert!(cache.try_contains_key(&1).is_err());
     }
 
     #[test]
@@ -1623,8 +1634,8 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
 
-        assert_eq!(cache.try_get(&1), Ok(Some(10)));
-        assert_eq!(cache.try_get(&2), Ok(None));
+        assert!(cache.try_get(&1).is_ok_and(|v| v == Some(10)));
+        assert!(cache.try_get(&2).is_ok_and(|v| v.is_none()));
     }
 
     #[test]
@@ -1632,7 +1643,7 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
         let _guards: Vec<_> = cache.shards.iter().map(|s| s.write()).collect();
-        assert_eq!(cache.try_get(&1), Err(()));
+        assert!(cache.try_get(&1).is_err());
     }
 
     #[test]
@@ -1640,8 +1651,8 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
 
-        assert_eq!(cache.try_peek(&1), Ok(Some(10)));
-        assert_eq!(cache.try_peek(&2), Ok(None));
+        assert!(cache.try_peek(&1).is_ok_and(|v| v == Some(10)));
+        assert!(cache.try_peek(&2).is_ok_and(|v| v.is_none()));
     }
 
     #[test]
@@ -1649,7 +1660,7 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
         let _guards: Vec<_> = cache.shards.iter().map(|s| s.write()).collect();
-        assert_eq!(cache.try_peek(&1), Err(()));
+        assert!(cache.try_peek(&1).is_err());
     }
 
     #[test]
@@ -1657,9 +1668,9 @@ mod tests {
         let cache = Cache::new(100);
         cache.insert(1, 10);
 
-        assert_eq!(cache.try_remove(&1), Ok(Some((1, 10))));
-        assert_eq!(cache.try_remove(&1), Ok(None));
-        assert_eq!(cache.try_remove(&99), Ok(None));
+        assert!(cache.try_remove(&1).is_ok_and(|v| v == Some((1, 10))));
+        assert!(cache.try_remove(&1).is_ok_and(|v| v == None));
+        assert!(cache.try_remove(&99).is_ok_and(|v| v == None));
     }
 
     #[test]
@@ -1668,7 +1679,7 @@ mod tests {
         cache.insert(1, 10);
         // Hold read locks on all shards so try_write is blocked.
         let guards: Vec<_> = cache.shards.iter().map(|s| s.read()).collect();
-        assert_eq!(cache.try_remove(&1), Err(()));
+        assert!(cache.try_remove(&1).is_err());
         drop(guards);
         // Item must still be present since the remove did not happen.
         assert_eq!(cache.get(&1), Some(10));
