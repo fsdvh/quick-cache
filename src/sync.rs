@@ -18,6 +18,8 @@ use crate::shard::EntryOrPlaceholder;
 pub use crate::sync_placeholder::{EntryAction, EntryResult, GuardResult, PlaceholderGuard};
 use crate::sync_placeholder::{JoinFuture, JoinResult};
 
+/// Error returned by non-blocking cache operations when the relevant shard lock
+/// could not be acquired immediately.
 #[derive(Debug)]
 pub struct LockContention;
 
@@ -260,7 +262,7 @@ impl<
 
     /// Attempts to check if a key exists in the cache without blocking.
     /// Returns `Ok(true)` if present, `Ok(false)` if absent,
-    /// or `Err(())` if the shard lock could not be acquired without blocking.
+    /// or `Err(LockContention)` if the shard lock could not be acquired without blocking.
     pub fn try_contains_key<Q>(&self, key: &Q) -> Result<bool, LockContention>
     where
         Q: Hash + Equivalent<Key> + ?Sized,
@@ -286,7 +288,7 @@ impl<
 
     /// Attempts to fetch an item from the cache whose key is `key`.
     /// Returns `Ok(Some(val))` if the key is present, `Ok(None)` if absent,
-    /// or `Err(())` if the shard lock could not be acquired without blocking.
+    /// or `Err(LockContention)` if the shard lock could not be acquired without blocking.
     pub fn try_get<Q>(&self, key: &Q) -> Result<Option<Val>, LockContention>
     where
         Q: Hash + Equivalent<Key> + ?Sized,
@@ -314,7 +316,7 @@ impl<
     /// Attempts to peek an item from the cache whose key is `key`.
     /// Contrary to gets, peeks don't alter the key "hotness".
     /// Returns `Ok(Some(val))` if the key is present, `Ok(None)` if absent,
-    /// or `Err(())` if the shard lock could not be acquired without blocking.
+    /// or `Err(LockContention)` if the shard lock could not be acquired without blocking.
     pub fn try_peek<Q>(&self, key: &Q) -> Result<Option<Val>, LockContention>
     where
         Q: Hash + Equivalent<Key> + ?Sized,
@@ -340,7 +342,7 @@ impl<
 
     /// Attempts to remove an item from the cache whose key is `key`.
     /// Returns `Ok(Some(entry))` with the removed entry if present, `Ok(None)` if absent,
-    /// or `Err(())` if the shard lock could not be acquired without blocking.
+    /// or `Err(LockContention)` if the shard lock could not be acquired without blocking.
     pub fn try_remove<Q>(&self, key: &Q) -> Result<Option<(Key, Val)>, LockContention>
     where
         Q: Hash + Equivalent<Key> + ?Sized,
