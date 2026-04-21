@@ -18,8 +18,11 @@ use crate::shard::EntryOrPlaceholder;
 pub use crate::sync_placeholder::{EntryAction, EntryResult, GuardResult, PlaceholderGuard};
 use crate::sync_placeholder::{JoinFuture, JoinResult};
 
-/// Error returned by non-blocking cache operations when the relevant shard lock
-/// could not be acquired immediately.
+/// Error returned by non-blocking cache operations that do not consume their
+/// inputs when the relevant shard lock could not be acquired immediately.
+///
+/// This is used by borrowed-key/read-path operations. Non-blocking operations
+/// that consume owned inputs may instead return those inputs on contention.
 #[derive(Debug)]
 pub struct LockContention;
 
