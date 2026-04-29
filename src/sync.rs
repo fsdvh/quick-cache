@@ -497,6 +497,30 @@ impl<
         }
     }
 
+    /// Attempts to insert an item in the cache with key `key` without blocking.
+    /// Returns `Ok(lcs)` with the lifecycle request state if the item was inserted,
+    /// or `Err((key, value))` if the shard lock could not be acquired without blocking.
+    /// Lock contention is the only failure mode: the inputs are returned so the
+    /// caller can retry or discard them.
+    pub fn try_insert_with_lifecycle_and_state(
+        &self,
+        key: Key,
+        value: Val,
+        lcs: &mut L::RequestState,
+    ) -> Result<(), (Key, Val)> {
+        let (shard, hash) = self.shard_for(&key).unwrap();
+
+        match shard.try_write() {
+            Some(mut shard) => {
+                let result = shard.insert(lcs, hash, key, value, InsertStrategy::Insert);
+                // result cannot err with the Insert strategy
+                debug_assert!(result.is_ok());
+                Ok(())
+            }
+            _ => Err((key, value)),
+        }
+    }
+
     /// Clear all items from the cache
     pub fn clear(&self) {
         for s in self.shards.iter() {
