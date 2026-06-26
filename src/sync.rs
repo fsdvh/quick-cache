@@ -59,7 +59,6 @@ pub struct Cache<
     hash_builder: B,
     shards: Box<[RwLock<CacheShard<Key, Val, We, B, L, SharedPlaceholder<Val>>>]>,
     shards_mask: u64,
-    lifecycle: L,
 }
 
 impl<Key: Eq + Hash, Val: Clone> Cache<Key, Val> {
@@ -76,15 +75,6 @@ impl<Key: Eq + Hash, Val: Clone> Cache<Key, Val> {
 }
 
 impl<Key: Eq + Hash, Val: Clone, We: Weighter<Key, Val> + Clone> Cache<Key, Val, We> {
-    /// Creates a new cache with a custom [`Weighter`].
-    ///
-    /// - `estimated_items_capacity` — expected number of items the cache will hold,
-    ///   roughly `weight_capacity / average_item_weight`.
-    /// - `weight_capacity` — total weight the cache may hold across all shards.
-    /// - `weighter` — determines the weight of each key–value pair.
-    ///
-    /// Use [`Cache::new`] when each item has unit weight (i.e. when you only care
-    /// about item count, not size).
     pub fn with_weighter(
         estimated_items_capacity: usize,
         weight_capacity: u64,
@@ -179,7 +169,6 @@ impl<
             shards: shards.into_boxed_slice(),
             hash_builder,
             shards_mask: num_shards - 1,
-            lifecycle,
         }
     }
 
@@ -370,6 +359,35 @@ impl<
         }
     }
 
+    /// Returns per-item statistics for `key`, or `None` if the key is not present.
+    /// Like peeks, this does not alter the key "hotness" or its access count.
+    #[cfg(feature = "stats")]
+    pub fn item_stats<Q>(&self, key: &Q) -> Option<crate::ItemStats>
+    where
+        Q: Hash + Equivalent<Key> + ?Sized,
+    {
+        let (shard, hash) = self.shard_for(key)?;
+        shard.read().item_stats(hash, key)
+    }
+
+    /// Attempts to return per-item statistics for `key`.
+    /// Like peeks, this does not alter the key "hotness" or its access count.
+    /// Returns `Ok(Some(stats))` if the key is present, `Ok(None)` if absent,
+    /// or `Err(LockContention)` if the shard lock could not be acquired without blocking.
+    #[cfg(feature = "stats")]
+    pub fn try_item_stats<Q>(&self, key: &Q) -> Result<Option<crate::ItemStats>, LockContention>
+    where
+        Q: Hash + Equivalent<Key> + ?Sized,
+    {
+        let Some((shard, hash)) = self.shard_for(key) else {
+            return Ok(None);
+        };
+        match shard.try_read() {
+            Some(guard) => Ok(guard.item_stats(hash, key)),
+            None => Err(LockContention),
+        }
+    }
+
     /// Remove an item from the cache whose key is `key`.
     /// Returns the removed entry, if any.
     pub fn remove<Q>(&self, key: &Q) -> Option<(Key, Val)>
@@ -416,36 +434,32 @@ impl<
     ///
     /// Returns `Ok` if the entry was admitted and `Err(_)` if it wasn't.
     pub fn replace(&self, key: Key, value: Val, soft: bool) -> Result<(), (Key, Val)> {
-        let lcs = self.replace_with_lifecycle(key, value, soft)?;
-        self.lifecycle.end_request(lcs);
-        Ok(())
+        let mut lcs = Default::default();
+        self.replace_with_lifecycle(key, value, soft, &mut lcs)
     }
 
     /// Inserts an item in the cache, but _only_ if an entry with key `key` already exists,
-    /// returning the lifecycle request state.
-    ///
+    /// recording any evicted items into the given lifecycle request state.
     /// If `soft` is set, the replace operation won't affect the "hotness" of the entry,
     /// even if the value is replaced.
     ///
-    /// Returns `Ok(lcs)` with the lifecycle request state if the entry was replaced.
-    /// Returns `Err((key, value))` if no entry existed for `key` (inputs are returned
-    /// so the caller can retry or discard them). The caller is responsible for passing
-    /// the returned state to [`Lifecycle::end_request`].
+    /// Returns `Ok` if the entry was admitted and `Err(_)` if it wasn't.
     ///
-    /// Prefer [`replace`](Self::replace) unless you need manual control over lifecycle
-    /// request lifetime.
+    /// `lcs` is a [`Lifecycle::RequestState`]; construct one with `Default::default()`.
+    /// The same `&mut lcs` can be threaded through multiple operations to batch the
+    /// eviction work. Evicted items are released when `lcs` is dropped.
     pub fn replace_with_lifecycle(
         &self,
         key: Key,
         value: Val,
         soft: bool,
-    ) -> Result<L::RequestState, (Key, Val)> {
-        let mut lcs = self.lifecycle.begin_request();
+        lcs: &mut L::RequestState,
+    ) -> Result<(), (Key, Val)> {
         let (shard, hash) = self.shard_for(&key).unwrap();
         shard
             .write()
-            .insert(&mut lcs, hash, key, value, InsertStrategy::Replace { soft })?;
-        Ok(lcs)
+            .insert(lcs, hash, key, value, InsertStrategy::Replace { soft })?;
+        Ok(())
     }
 
     /// Retains only the items specified by the predicate.
@@ -462,34 +476,26 @@ impl<
 
     /// Inserts an item in the cache with key `key`.
     pub fn insert(&self, key: Key, value: Val) {
-        let lcs = self.insert_with_lifecycle(key, value);
-        self.lifecycle.end_request(lcs);
+        let mut lcs = Default::default();
+        self.insert_with_lifecycle(key, value, &mut lcs);
     }
 
-    /// Inserts an item in the cache with key `key`, returning the lifecycle request state.
-    ///
-    /// Unlike [`insert`](Self::insert), the lifecycle request is **not** ended automatically.
-    /// The caller is responsible for passing the returned state to [`Lifecycle::end_request`]
-    /// when it is ready to drop any evicted items outside the shard lock.
-    ///
-    /// This is useful when coalescing multiple insertions into a single lifecycle request,
-    /// or when you need to control exactly when evicted items are dropped.
-    pub fn insert_with_lifecycle(&self, key: Key, value: Val) -> L::RequestState {
-        let mut lcs = self.lifecycle.begin_request();
-        self.insert_with_state(key, value, &mut lcs);
-        lcs
+    /// Attempts to insert an item in the cache with key `key` without blocking.
+    /// Returns `Ok(())` if the item was inserted, or `Err((key, value))` if the shard lock
+    /// could not be acquired without blocking. Lock contention is the only failure
+    /// mode: the inputs are returned so the caller can retry or discard them.
+    pub fn try_insert(&self, key: Key, value: Val) -> Result<(), (Key, Val)> {
+        let mut lcs = Default::default();
+        self.try_insert_with_lifecycle(key, value, &mut lcs)
     }
 
-    /// Inserts an item in the cache with key `key` using an existing lifecycle request state.
+    /// Inserts an item in the cache with key `key`, recording any evicted items into the
+    /// given lifecycle request state.
     ///
-    /// `lcs` must have been obtained from a prior [`Lifecycle::begin_request`] call and
-    /// must **not** have been passed to [`Lifecycle::end_request`] yet. Any items evicted
-    /// by this insert are recorded into `lcs` and will be dropped when `end_request` is
-    /// eventually called.
-    ///
-    /// Prefer [`insert`](Self::insert) for the common case where you do not need to
-    /// manage the lifecycle state manually.
-    pub fn insert_with_state(&self, key: Key, value: Val, lcs: &mut L::RequestState) {
+    /// `lcs` is a [`Lifecycle::RequestState`]; construct one with `Default::default()`.
+    /// The same `&mut lcs` can be threaded through multiple operations to batch the
+    /// eviction work. Evicted items are released when `lcs` is dropped.
+    pub fn insert_with_lifecycle(&self, key: Key, value: Val, lcs: &mut L::RequestState) {
         let (shard, hash) = self.shard_for(&key).unwrap();
         let result = shard
             .write()
@@ -498,39 +504,16 @@ impl<
         debug_assert!(result.is_ok());
     }
 
-    /// Attempts to insert an item in the cache with key `key` without blocking.
+    /// Attempts to insert an item in the cache with key `key` without blocking, recording
+    /// any evicted items into the given lifecycle request state.
     /// Returns `Ok(())` if the item was inserted, or `Err((key, value))` if the shard lock
-    /// could not be acquired without blocking. Lock contention is the only failure
-    /// mode: the inputs are returned so the caller can retry or discard them.
-    pub fn try_insert(&self, key: Key, value: Val) -> Result<(), (Key, Val)> {
-        let lcs = self.try_insert_with_lifecycle(key, value)?;
-        self.lifecycle.end_request(lcs);
-        Ok(())
-    }
-
-    /// Attempts to insert an item in the cache with key `key` without blocking.
-    /// Returns `Ok(lcs)` with the lifecycle request state if the item was inserted,
-    /// or `Err((key, value))` if the shard lock could not be acquired without blocking.
-    /// Lock contention is the only failure mode: the inputs are returned so the
-    /// caller can retry or discard them.
+    /// could not be acquired without blocking. Lock contention is the only failure mode:
+    /// the inputs are returned so the caller can retry or discard them.
+    ///
+    /// `lcs` is a [`Lifecycle::RequestState`]; construct one with `Default::default()`.
+    /// The same `&mut lcs` can be threaded through multiple operations to batch the
+    /// eviction work. Evicted items are released when `lcs` is dropped.
     pub fn try_insert_with_lifecycle(
-        &self,
-        key: Key,
-        value: Val,
-    ) -> Result<L::RequestState, (Key, Val)> {
-        // Tradeoff: begin_request is called before acquiring the shard lock to avoid holding
-        // the lock during potentially expensive lifecycle initialization.
-        let mut lcs = self.lifecycle.begin_request();
-        self.try_insert_with_state(key, value, &mut lcs)?;
-        Ok(lcs)
-    }
-
-    /// Attempts to insert an item in the cache with key `key` without blocking.
-    /// Returns `Ok(lcs)` with the lifecycle request state if the item was inserted,
-    /// or `Err((key, value))` if the shard lock could not be acquired without blocking.
-    /// Lock contention is the only failure mode: the inputs are returned so the
-    /// caller can retry or discard them.
-    pub fn try_insert_with_state(
         &self,
         key: Key,
         value: Val,
@@ -599,7 +582,9 @@ impl<
         let shard_weight_cap = new_weight_capacity.saturating_add(self.shards.len() as u64 - 1)
             / self.shards.len() as u64;
         for shard in &*self.shards {
-            shard.write().set_capacity(shard_weight_cap);
+            let mut lcs = Default::default();
+            // `lcs` drops after this statement's lock guard, releasing evicted items outside the lock.
+            shard.write().set_capacity(shard_weight_cap, &mut lcs);
         }
     }
 
@@ -626,21 +611,12 @@ impl<
         if let Some(v) = shard.read().get(hash, key) {
             return GuardResult::Value(v.clone());
         }
-        PlaceholderGuard::join(&self.lifecycle, shard, hash, key, timeout)
+        PlaceholderGuard::join(shard, hash, key, timeout)
     }
 
-    /// Gets an item from the cache with key `key`, or inserts one produced by `with`.
+    /// Gets or inserts an item in the cache with key `key`.
     ///
-    /// If the key is already present, the cached value is returned without calling `with`.
-    /// Otherwise, the cache is locked for this key (other callers to `get_value_or_guard`
-    /// or the `get_or_insert` family will block until the value is populated), `with` is
-    /// called to produce the value, and the result is inserted and returned.
-    ///
-    /// `with` may return an error, in which case nothing is inserted and the error is
-    /// propagated. The placeholder is dropped so waiting callers can retry.
-    ///
-    /// See also [`get_value_or_guard`](Self::get_value_or_guard) for more control over
-    /// the placeholder lifecycle.
+    /// See also `get_value_or_guard` and `get_value_or_guard_async`.
     pub fn get_or_insert_with<Q, E>(
         &self,
         key: &Q,
@@ -679,7 +655,7 @@ impl<
             if let Some(v) = shard.read().get(hash, key) {
                 return Ok(v.clone());
             }
-            match JoinFuture::new(&self.lifecycle, shard, hash, key).await {
+            match JoinFuture::new(shard, hash, key).await {
                 JoinResult::Filled(Some(shared)) => {
                     // SAFETY: Filled means the value was set by the loader.
                     return Ok(unsafe { shared.value().unwrap_unchecked().clone() });
@@ -691,12 +667,7 @@ impl<
         }
     }
 
-    /// Gets an item from the cache with key `key`, or inserts one produced by `with`.
-    ///
-    /// Async counterpart of [`get_or_insert_with`](Self::get_or_insert_with). The `with`
-    /// future is only polled when no value exists for `key`. While `with` is being awaited,
-    /// other tasks looking up the same key will suspend and resume once the value is
-    /// inserted (or the guard is dropped without inserting).
+    /// Gets or inserts an item in the cache with key `key`.
     pub async fn get_or_insert_async<Q, E>(
         &self,
         key: &Q,
@@ -790,21 +761,16 @@ impl<
                 EntryOrPlaceholder::Replaced(shared, old_val) => {
                     drop(shard_guard);
                     return EntryResult::Replaced(
-                        PlaceholderGuard::start_loading(&self.lifecycle, shard, shared),
+                        PlaceholderGuard::start_loading(shard, shared),
                         old_val,
                     );
                 }
                 EntryOrPlaceholder::NewPlaceholder(shared) => {
                     drop(shard_guard);
-                    return EntryResult::Vacant(PlaceholderGuard::start_loading(
-                        &self.lifecycle,
-                        shard,
-                        shared,
-                    ));
+                    return EntryResult::Vacant(PlaceholderGuard::start_loading(shard, shared));
                 }
                 EntryOrPlaceholder::ExistingPlaceholder(shared) => {
                     match PlaceholderGuard::wait_for_placeholder(
-                        &self.lifecycle,
                         shard,
                         shard_guard,
                         shared,
@@ -849,16 +815,14 @@ impl<
                     EntryOrPlaceholder::Replaced(shared, old_val) => {
                         drop(shard_guard);
                         Ok(EntryResult::Replaced(
-                            PlaceholderGuard::start_loading(&self.lifecycle, shard, shared),
+                            PlaceholderGuard::start_loading(shard, shared),
                             old_val,
                         ))
                     }
                     EntryOrPlaceholder::NewPlaceholder(shared) => {
                         drop(shard_guard);
                         Ok(EntryResult::Vacant(PlaceholderGuard::start_loading(
-                            &self.lifecycle,
-                            shard,
-                            shared,
+                            shard, shared,
                         )))
                     }
                     EntryOrPlaceholder::ExistingPlaceholder(_) => Err(()),
@@ -866,7 +830,7 @@ impl<
             };
             match result {
                 Ok(entry_result) => return entry_result,
-                Err(()) => match JoinFuture::new(&self.lifecycle, shard, hash, key).await {
+                Err(()) => match JoinFuture::new(shard, hash, key).await {
                     JoinResult::Filled(_) => continue,
                     JoinResult::Guard(g) => return EntryResult::Vacant(g),
                     JoinResult::Timeout => unsafe { unreachable_unchecked() },
@@ -1005,11 +969,6 @@ impl<Key, Val> Lifecycle<Key, Val> for DefaultLifecycle<Key, Val> {
     type RequestState = [Option<(Key, Val)>; 2];
 
     #[inline]
-    fn begin_request(&self) -> Self::RequestState {
-        [None, None]
-    }
-
-    #[inline]
     fn on_evict(&self, state: &mut Self::RequestState, key: Key, val: Val) {
         if std::mem::needs_drop::<(Key, Val)>() {
             if state[0].is_none() {
@@ -1024,6 +983,7 @@ impl<Key, Val> Lifecycle<Key, Val> for DefaultLifecycle<Key, Val> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard::SharedPlaceholder as _;
     use std::{
         sync::{Arc, Barrier},
         thread,
@@ -1767,6 +1727,29 @@ mod tests {
         assert!(cache.try_peek(&1).is_err());
     }
 
+    #[cfg(feature = "stats")]
+    #[test]
+    fn test_item_stats() {
+        let cache = Cache::new(100);
+        // Missing key has no stats.
+        assert!(cache.item_stats(&1).is_none());
+
+        cache.insert(1, 10);
+        // Insert alone is not a hit.
+        assert_eq!(cache.item_stats(&1).map(|s| s.access_count), Some(0));
+
+        // Each get increments the per-item access count.
+        cache.get(&1);
+        cache.get(&1);
+        cache.get(&1);
+        assert_eq!(cache.item_stats(&1).map(|s| s.access_count), Some(3));
+
+        // Peeking (including item_stats itself) does not alter the count.
+        cache.peek(&1);
+        let _ = cache.item_stats(&1);
+        assert_eq!(cache.item_stats(&1).map(|s| s.access_count), Some(3));
+    }
+
     #[test]
     fn test_try_remove() {
         let cache = Cache::new(100);
@@ -1815,18 +1798,74 @@ mod tests {
     #[test]
     fn test_try_insert_with_lifecycle() {
         let cache = Cache::new(100);
+        let mut lcs = Default::default();
 
-        // Successful insert returns the lifecycle request state.
-        let result = cache.try_insert_with_lifecycle(1, 10);
-        assert!(result.is_ok());
-        let lcs = result.ok().unwrap();
-        cache.lifecycle.end_request(lcs);
+        // Successful insert records evictions into the provided request state.
+        assert_eq!(cache.try_insert_with_lifecycle(1, 10, &mut lcs), Ok(()));
         assert_eq!(cache.get(&1), Some(10));
+
+        // The same request state can be threaded through several operations.
+        assert_eq!(cache.try_insert_with_lifecycle(2, 20, &mut lcs), Ok(()));
+        assert_eq!(cache.get(&2), Some(20));
 
         // Contended when a read lock is held.
         let guards: Vec<_> = cache.shards.iter().map(|s| s.read()).collect();
-        assert_eq!(cache.try_insert_with_lifecycle(2, 20), Err((2, 20)));
+        assert_eq!(
+            cache.try_insert_with_lifecycle(3, 30, &mut lcs),
+            Err((3, 30))
+        );
         drop(guards);
-        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.get(&3), None);
+    }
+
+    #[test]
+    fn test_guard_leak() {
+        let cache: Cache<i32, i32> = Cache::new(8);
+        let guard1 = match cache.get_value_or_guard(&1, None) {
+            GuardResult::Guard(g) => g,
+            _ => panic!("expected guard"),
+        };
+        let idx1 = guard1.shared().idx();
+        drop(guard1);
+        let guard2 = match cache.get_value_or_guard(&1, None) {
+            GuardResult::Guard(g) => g,
+            _ => panic!("expected guard"),
+        };
+        let idx2 = guard2.shared().idx();
+        drop(guard2);
+        assert_eq!(idx1, idx2);
+    }
+
+    // A real insert overwrites the placeholder in place, reusing its slab slot as
+    // a Resident. Dropping the now-stale guard must not free that slot, otherwise
+    // the live entry is evicted while the map still references it.
+    #[test]
+    fn test_guard_drop_after_overwrite_insert() {
+        let cache: Cache<i32, i32> = Cache::new(8);
+        let guard = match cache.get_value_or_guard(&1, None) {
+            GuardResult::Guard(g) => g,
+            _ => panic!("expected guard"),
+        };
+        cache.insert(1, 100);
+        assert_eq!(cache.get(&1), Some(100));
+        drop(guard);
+        assert_eq!(cache.get(&1), Some(100));
+    }
+
+    // A remove frees the placeholder's slab slot, which a later insert reuses for a
+    // different key. Dropping the original guard must not free that slot again, or
+    // it evicts the unrelated key.
+    #[test]
+    fn test_guard_drop_after_remove_and_reuse() {
+        let cache: Cache<i32, i32> = Cache::new(8);
+        let guard = match cache.get_value_or_guard(&1, None) {
+            GuardResult::Guard(g) => g,
+            _ => panic!("expected guard"),
+        };
+        cache.remove(&1);
+        cache.insert(2, 222);
+        assert_eq!(cache.get(&2), Some(222));
+        drop(guard);
+        assert_eq!(cache.get(&2), Some(222));
     }
 }

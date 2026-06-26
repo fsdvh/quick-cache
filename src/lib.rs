@@ -79,7 +79,7 @@
 //! | `parking_lot` | ✓ | Use [parking_lot](https://crates.io/crates/parking_lot) for synchronization primitives. Mutually exclusive with `sharded-lock`. |
 //! | `sharded-lock` | | Use [`crossbeam_utils::sync::ShardedLock`](https://docs.rs/crossbeam-utils/latest/crossbeam_utils/sync/struct.ShardedLock.html) for synchronization primitives. Mutually exclusive with `parking_lot`. |
 //! | `shuttle` | | Enable [shuttle](https://crates.io/crates/shuttle) testing support for concurrency testing. |
-//! | `stats` | | Enable cache statistics tracking via the `hits()` and `misses()` methods. |
+//! | `stats` | | Enable cache statistics tracking via the `hits()`, `misses()`, and per-item `item_stats()` methods. Overhead: adds an 8-byte per-item access counter (`AtomicU64`) to each resident item — raising per-entry memory by up to 8 bytes, depending on layout — and performs two atomic increments per cache hit and one per miss. |
 #![allow(clippy::type_complexity)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -164,8 +164,31 @@ impl<Key, Val> Weighter<Key, Val> for UnitWeighter {
 /// Hooks into the lifetime of the cache items.
 ///
 /// The functions should be small and very fast, otherwise the cache performance might be negatively affected.
+///
+/// # Request state
+///
+/// Operations that may evict items thread a [`RequestState`](Lifecycle::RequestState)
+/// through the eviction hooks. It is a per-request accumulator: the cache constructs a
+/// fresh one via [`Default`], the `on_evict*`/`before_evict` hooks record into it, and it
+/// is finalized by its own [`Drop`] (which, for example, releases evicted items _after_
+/// the shard lock is dropped).
+///
+/// The `_with_lifecycle` cache methods take `&mut RequestState`, letting a caller drive
+/// several operations against a single state — e.g. to batch the eviction work or inspect
+/// evicted items before dropping it:
+///
+/// ```ignore
+/// let mut lcs = Default::default();
+/// cache.insert_with_lifecycle(k1, v1, &mut lcs);
+/// cache.insert_with_lifecycle(k2, v2, &mut lcs);
+/// // inspect `lcs` here if desired; evicted items are released when it drops
+/// ```
 pub trait Lifecycle<Key, Val> {
-    type RequestState;
+    /// Per-request accumulator threaded through the eviction hooks.
+    ///
+    /// Constructed via [`Default`] at the start of each request and finalized by its
+    /// [`Drop`]. Keep it cheap to create and drop.
+    type RequestState: Default;
 
     /// Returns whether the item is pinned. Items that are pinned can't be evicted.
     /// Note that a pinned item can still be replaced with get_mut, insert, replace and similar APIs.
@@ -181,9 +204,6 @@ pub trait Lifecycle<Key, Val> {
         false
     }
 
-    /// Called before the insert request starts, e.g.: insert, replace.
-    fn begin_request(&self) -> Self::RequestState;
-
     /// Called when a cache item is about to be evicted.
     /// Note that value replacement (e.g. insertions for the same key) won't call this method.
     ///
@@ -196,17 +216,43 @@ pub trait Lifecycle<Key, Val> {
     fn before_evict(&self, state: &mut Self::RequestState, key: &Key, val: &mut Val) {}
 
     /// Called when an item is evicted.
-    fn on_evict(&self, state: &mut Self::RequestState, key: Key, val: Val);
-
-    /// Called after a request finishes, e.g.: insert, replace.
     ///
-    /// Notes:
-    /// This will _not_ be called when using `_with_lifecycle` apis, which will return the RequestState instead.
-    /// This will _not_ be called if the request errored (e.g. a replace didn't find a value to replace).
-    /// If needed, Drop for RequestState can be used to detect these cases.
+    /// To distinguish evictions from the hot vs cold queues, override
+    /// [`Lifecycle::on_evict_hot`] and/or [`Lifecycle::on_evict_cold`] instead;
+    /// they default to delegating here.
+    ///
+    /// If none of `on_evict`, `on_evict_hot`, or `on_evict_cold` is overridden,
+    /// eviction notifications are silently dropped.
+    ///
+    /// Note: items that are rejected without ever being admitted to the cache
+    /// (oversized inserts and oversized placeholder values) are routed through
+    /// [`Lifecycle::on_evict_cold`], which by default reaches this method.
     #[allow(unused_variables)]
     #[inline]
-    fn end_request(&self, state: Self::RequestState) {}
+    fn on_evict(&self, state: &mut Self::RequestState, key: Key, val: Val) {}
+
+    /// Called when an item is evicted from the cold queue.
+    ///
+    /// By default delegates to [`Lifecycle::on_evict`].
+    ///
+    /// Note: items that are rejected without ever being admitted to the cache
+    /// (oversized inserts and oversized placeholder values) are also reported
+    /// via this method.
+    #[inline]
+    fn on_evict_cold(&self, state: &mut Self::RequestState, key: Key, val: Val) {
+        self.on_evict(state, key, val)
+    }
+
+    /// Called when an item is evicted from the hot queue.
+    ///
+    /// By default delegates to [`Lifecycle::on_evict`].
+    ///
+    /// Note: rejected (never-admitted) items are reported via
+    /// [`Lifecycle::on_evict_cold`], not this method.
+    #[inline]
+    fn on_evict_hot(&self, state: &mut Self::RequestState, key: Key, val: Val) {
+        self.on_evict(state, key, val)
+    }
 }
 
 /// The memory used by the cache
@@ -223,6 +269,25 @@ impl MemoryUsed {
     pub fn total(&self) -> usize {
         self.entries + self.map
     }
+}
+
+/// Per-item statistics returned by `item_stats`.
+///
+/// Only available with the `stats` feature enabled. Enabling that feature adds an
+/// 8-byte per-item access counter to each resident item (raising per-entry memory
+/// by up to 8 bytes, depending on layout) and performs two atomic increments per
+/// cache hit and one per miss.
+#[cfg(feature = "stats")]
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ItemStats {
+    /// Number of times the item has been accessed (read) since it became resident.
+    ///
+    /// Incremented on every cache hit (`get`/`get_mut`/`get_value_or_guard`/`entry`).
+    /// Unlike the internal eviction counter, this is monotonic per residency and is
+    /// not bounded by the eviction policy. It resets to zero if the slot is reused for
+    /// a new value (e.g. after eviction and re-insertion).
+    pub access_count: u64,
 }
 
 #[cfg(test)]
